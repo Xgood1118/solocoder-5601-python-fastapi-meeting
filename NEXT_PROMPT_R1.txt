@@ -1,0 +1,13 @@
+会议室预约系统基本跑通了，CRUD、冲突检测、审批流、通知、日历视图全有，但第一轮评审发现几个硬伤得修。
+
+第一个问题是过去时间的预约没有拦截。传 2025-01-01 的 start_time 也能成功创建预约，server 只校验了 end > start，没校验 start > now。应该在创建 booking 的时候加一道校验，过去的时间不能约——现在已经开始的也不行，至少得提前 5 分钟起。
+
+第二个是权限问题比较严重。目前系统里 user_id 全靠请求体里的参数传过来，服务端直接信任谁是谁。比如 A 把自己的 user_id 改成 B 的就能 cancel B 的预约、release B 的已结束预约、甚至读 B 的所有通知。虽然 PROMPT 里没说要 JWT 登录，但至少得加一层 user -> booking 的归属校验：只有预约的发起人自己能 cancel/查看自己的预约，管理员（可以配个 admin 用户列表）能看所有。通知也一样，只能读自己的通知列表。
+
+第三个是竞态条件问题。目前的冲突检测和预约写入不是原子的：两个请求同时来同时过 find_conflicts 都看到没冲突，然后都写进去变成重叠预约。虽然在单进程 GIL 下不太容易复现，但用 uvicorn --workers 2 起两个 worker 时各自有独立内存存储，就能稳定复现双 booking 了。解决方案可以加个全局锁，或者把 find+insert 包在同一个 lock 里。
+
+第四个是 HTTP 状态码不对。不存在的 room_id 创建预约时返回 400，应该返回 404。可以看一眼 _err 函数的默认 status code 是不是写死了 400。
+
+第五个是 ENDED 状态的书没有从冲突检查里排除。auto_update_statuses 把结束了的状态变成 ENDED，但 _list_active_for_room 过滤时只排除了 CANCELLED 和 REJECTED，没排除 ENDED。如果某天凌晨系统自动把昨天过期的书全标记成 ENDED，但早上的新预约在扫冲突时仍然看到了 ENDED 的记录，做冲突判断就多做了一步无用功。
+
+R2 验收标准：发一个 2025 年的 booking 被 400 拒绝；A 用户改 user_id 不能操作 B 的 booking；两个并发请求同时发同一时段的 booking 只有一个成功；不存在 room_id 返回 404；ENDED booking 不再出现在冲突检查结果里。
