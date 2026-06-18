@@ -1,0 +1,23 @@
+approval:
+  amount_threshold: 5000
+  people_threshold: 20
+
+reminder:
+  minutes_before: 15
+
+default_rooms:
+  - name: "A101"
+    floor: 1
+    capacity: 10
+    equipment: ["projector", "whiteboard"]
+    requires_approval: false
+  - name: "A201"
+    floor: 2
+    capacity: 20
+    equipment: ["projector", "whiteboard", "video_conference"]
+    requires_approval: false
+  - name: "B301"
+    floor: 3
+    capacity: 50
+    equipment: ["projector", "whiteboard", "video_conference", "sound_system"]
+    requires_approval: true
