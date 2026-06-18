@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from typing import Optional, List, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -25,7 +25,7 @@ class RoomDisable(BaseModel):
 
 
 class BookingCancel(BaseModel):
-    user_id: str
+    pass
 
 
 @asynccontextmanager
@@ -51,8 +51,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="会议室预订系统", lifespan=lifespan)
 
 
-def _ok(data: Any = None) -> JSONResponse:
-    return JSONResponse(status_code=200, content={"ok": True, "data": data})
+def _ok(data: Any = None, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"ok": True, "data": data})
 
 
 def _err(msg: str, code: int = 400, extra: Optional[dict] = None) -> HTTPException:
@@ -60,6 +60,23 @@ def _err(msg: str, code: int = 400, extra: Optional[dict] = None) -> HTTPExcepti
     if extra:
         detail.update(extra)
     raise HTTPException(status_code=code, detail=detail)
+
+
+def _handle_error(result: dict):
+    code = result.get("status", 400)
+    extra = {}
+    if "conflicts" in result:
+        extra["conflicts"] = [c.model_dump(mode="json") for c in result["conflicts"]]
+    _err(result["error"], code, extra or None)
+
+
+def get_current_user(x_user_id: str = Header(..., alias="X-User-Id")) -> str:
+    return x_user_id
+
+
+def require_owner(user_id: str, current_user: str):
+    if user_id != current_user:
+        _err("not authorized", 403)
 
 
 @app.get("/health")
@@ -80,10 +97,10 @@ def get_room(room_id: str):
     return _ok(r.model_dump(mode="json"))
 
 
-@app.post("/rooms", status_code=201)
+@app.post("/rooms")
 def create_room(data: RoomCreate):
     r = room_store.create(data)
-    return _ok(r.model_dump(mode="json"))
+    return _ok(r.model_dump(mode="json"), 201)
 
 
 @app.put("/rooms/{room_id}")
@@ -117,52 +134,60 @@ def delete_room(room_id: str):
     return _ok()
 
 
-@app.post("/bookings", status_code=201)
-def create_booking(data: BookingCreate):
+@app.post("/bookings")
+def create_booking(data: BookingCreate, current_user: str = Depends(get_current_user)):
+    require_owner(data.user_id, current_user)
     result = booking_store.create(data)
     if not result.get("ok"):
-        extra = {}
-        if "conflicts" in result:
-            extra["conflicts"] = [c.model_dump(mode="json") for c in result["conflicts"]]
-        _err(result["error"], 400, extra or None)
+        _handle_error(result)
     b = result["booking"]
     enriched = BookingWithStatus(
         **b.model_dump(mode="json"),
         effective_status=compute_effective_status(b),
     )
-    return _ok(enriched.model_dump(mode="json"))
+    return _ok(enriched.model_dump(mode="json"), 201)
 
 
 @app.get("/bookings/{booking_id}")
-def get_booking(booking_id: str):
+def get_booking(booking_id: str, current_user: str = Depends(get_current_user)):
     b = query_service.get_booking_detail(booking_id)
     if not b:
         _err("booking not found", 404)
+    require_owner(b.user_id, current_user)
     return _ok(b.model_dump(mode="json"))
 
 
 @app.post("/bookings/{booking_id}/cancel")
-def cancel_booking(booking_id: str, data: BookingCancel):
-    result = booking_store.cancel(booking_id, data.user_id)
+def cancel_booking(
+    booking_id: str,
+    _data: BookingCancel = BookingCancel(),
+    current_user: str = Depends(get_current_user),
+):
+    result = booking_store.cancel(booking_id, current_user)
     if not result.get("ok"):
-        _err(result["error"])
+        _handle_error(result)
     return _ok(result["booking"].model_dump(mode="json"))
 
 
 @app.post("/bookings/{booking_id}/release")
-def release_booking(booking_id: str, data: BookingRelease):
+def release_booking(
+    booking_id: str,
+    data: BookingRelease,
+    current_user: str = Depends(get_current_user),
+):
     b = booking_store.get(booking_id)
     if not b:
         _err("booking not found", 404)
+    require_owner(b.user_id, current_user)
     release_dt = None
     if data.release_time:
         try:
             release_dt = timeutil.parse_dt(data.release_time)
         except Exception:
             _err("invalid release_time format")
-    result = booking_store.release(booking_id, b.user_id, release_dt)
+    result = booking_store.release(booking_id, current_user, release_dt)
     if not result.get("ok"):
-        _err(result["error"])
+        _handle_error(result)
     enriched = BookingWithStatus(
         **result["booking"].model_dump(mode="json"),
         effective_status=compute_effective_status(result["booking"]),
@@ -171,20 +196,22 @@ def release_booking(booking_id: str, data: BookingRelease):
 
 
 @app.post("/bookings/{booking_id}/renew")
-def renew_booking(booking_id: str, data: BookingRenew):
+def renew_booking(
+    booking_id: str,
+    data: BookingRenew,
+    current_user: str = Depends(get_current_user),
+):
     b = booking_store.get(booking_id)
     if not b:
         _err("booking not found", 404)
+    require_owner(b.user_id, current_user)
     try:
         new_end = timeutil.parse_dt(data.new_end_time)
     except Exception:
         _err("invalid new_end_time format")
-    result = booking_store.renew(booking_id, b.user_id, new_end)
+    result = booking_store.renew(booking_id, current_user, new_end)
     if not result.get("ok"):
-        extra = {}
-        if "conflicts" in result:
-            extra["conflicts"] = [c.model_dump(mode="json") for c in result["conflicts"]]
-        _err(result["error"], 400, extra or None)
+        _handle_error(result)
     enriched = BookingWithStatus(
         **result["booking"].model_dump(mode="json"),
         effective_status=compute_effective_status(result["booking"]),
@@ -203,18 +230,28 @@ def list_pending_approvals():
 
 
 @app.post("/approvals/{booking_id}/approve")
-def approve_booking(booking_id: str, action: ApprovalAction):
+def approve_booking(
+    booking_id: str,
+    action: ApprovalAction,
+    current_user: str = Depends(get_current_user),
+):
+    require_owner(action.approver_id, current_user)
     result = approval_service.approve(booking_id, action)
     if not result.get("ok"):
-        _err(result["error"])
+        _handle_error(result)
     return _ok(result["booking"].model_dump(mode="json"))
 
 
 @app.post("/approvals/{booking_id}/reject")
-def reject_booking(booking_id: str, action: ApprovalAction):
+def reject_booking(
+    booking_id: str,
+    action: ApprovalAction,
+    current_user: str = Depends(get_current_user),
+):
+    require_owner(action.approver_id, current_user)
     result = approval_service.reject(booking_id, action)
     if not result.get("ok"):
-        _err(result["error"])
+        _handle_error(result)
     return _ok(result["booking"].model_dump(mode="json"))
 
 
@@ -231,7 +268,12 @@ def list_room_bookings(room_id: str, d: str = Query(..., alias="date")):
 
 
 @app.get("/users/{user_id}/bookings")
-def list_user_bookings(user_id: str, status: Optional[EffectiveStatus] = None):
+def list_user_bookings(
+    user_id: str,
+    status: Optional[EffectiveStatus] = None,
+    current_user: str = Depends(get_current_user),
+):
+    require_owner(user_id, current_user)
     bookings = query_service.list_user_bookings(user_id, status)
     return _ok([b.model_dump(mode="json") for b in bookings])
 
@@ -249,19 +291,33 @@ def list_in_progress_bookings():
 
 
 @app.get("/users/{user_id}/notifications")
-def list_notifications(user_id: str, unread_only: bool = False):
+def list_notifications(
+    user_id: str,
+    unread_only: bool = False,
+    current_user: str = Depends(get_current_user),
+):
+    require_owner(user_id, current_user)
     notifs = notify_store.list_for_user(user_id, unread_only=unread_only)
     return _ok([n.model_dump(mode="json") for n in notifs])
 
 
 @app.post("/users/{user_id}/notifications/{notif_id}/read")
-def mark_notification_read(user_id: str, notif_id: str):
+def mark_notification_read(
+    user_id: str,
+    notif_id: str,
+    current_user: str = Depends(get_current_user),
+):
+    require_owner(user_id, current_user)
     if not notify_store.mark_read(user_id, notif_id):
         _err("notification not found", 404)
     return _ok()
 
 
 @app.post("/users/{user_id}/notifications/read-all")
-def mark_all_notifications_read(user_id: str):
+def mark_all_notifications_read(
+    user_id: str,
+    current_user: str = Depends(get_current_user),
+):
+    require_owner(user_id, current_user)
     count = notify_store.mark_all_read(user_id)
     return _ok({"marked": count})

@@ -3,6 +3,7 @@ from typing import List, Optional, Dict, Any
 from enum import Enum
 from pydantic import BaseModel, Field
 import uuid
+import threading
 
 from . import timeutil
 from .room import room_store
@@ -113,6 +114,7 @@ def needs_approval(participants: int, amount: float, room_requires_approval: boo
 class BookingStore:
     def __init__(self):
         self._bookings: Dict[str, Booking] = {}
+        self._lock = threading.RLock()
 
     def _gen_id(self) -> str:
         return f"booking_{uuid.uuid4().hex[:12]}"
@@ -120,7 +122,9 @@ class BookingStore:
     def _list_active_for_room(self, room_id: str) -> List[Booking]:
         return [
             b for b in self._bookings.values()
-            if b.room_id == room_id and b.status not in {BookingStatus.CANCELLED, BookingStatus.REJECTED}
+            if b.room_id == room_id and b.status not in {
+                BookingStatus.CANCELLED, BookingStatus.REJECTED, BookingStatus.ENDED,
+            }
         ]
 
     def find_conflicts(
@@ -142,58 +146,63 @@ class BookingStore:
         return conflicts
 
     def create(self, data: BookingCreate) -> Dict[str, Any]:
-        room = room_store.get(data.room_id)
-        if not room:
-            return {"ok": False, "error": "room not found"}
-        if room.is_disabled:
-            reason = room.disabled_reason or "room is disabled"
-            return {"ok": False, "error": f"room is disabled: {reason}"}
+        with self._lock:
+            room = room_store.get(data.room_id)
+            if not room:
+                return {"ok": False, "error": "room not found", "status": 404}
+            if room.is_disabled:
+                reason = room.disabled_reason or "room is disabled"
+                return {"ok": False, "error": f"room is disabled: {reason}", "status": 400}
 
-        try:
-            start = timeutil.parse_dt(data.start_time)
-            end = timeutil.parse_dt(data.end_time)
-        except Exception:
-            return {"ok": False, "error": "invalid datetime format, use ISO 8601"}
+            try:
+                start = timeutil.parse_dt(data.start_time)
+                end = timeutil.parse_dt(data.end_time)
+            except Exception:
+                return {"ok": False, "error": "invalid datetime format, use ISO 8601", "status": 400}
 
-        err = timeutil.validate_range(start, end)
-        if err:
-            return {"ok": False, "error": err}
+            err = timeutil.validate_range(start, end)
+            if err:
+                return {"ok": False, "error": err, "status": 400}
 
-        if data.participants > room.capacity:
-            return {"ok": False, "error": f"participants exceed room capacity ({room.capacity})"}
+            now = timeutil.now()
+            if end <= now:
+                return {"ok": False, "error": "cannot create booking in the past", "status": 400}
 
-        conflicts = self.find_conflicts(data.room_id, start, end)
-        if conflicts:
-            return {"ok": False, "error": "time conflict", "conflicts": conflicts}
+            if data.participants > room.capacity:
+                return {"ok": False, "error": f"participants exceed room capacity ({room.capacity})", "status": 400}
 
-        status = BookingStatus.PENDING_APPROVAL if needs_approval(
-            data.participants, data.amount, room.requires_approval
-        ) else BookingStatus.APPROVED
+            conflicts = self.find_conflicts(data.room_id, start, end)
+            if conflicts:
+                return {"ok": False, "error": "time conflict", "conflicts": conflicts, "status": 409}
 
-        booking = Booking(
-            id=self._gen_id(),
-            room_id=data.room_id,
-            user_id=data.user_id,
-            title=data.title,
-            start_time=start,
-            end_time=end,
-            participants=data.participants,
-            amount=data.amount,
-            status=status,
-            created_at=timeutil.now(),
-        )
-        self._bookings[booking.id] = booking
+            status = BookingStatus.PENDING_APPROVAL if needs_approval(
+                data.participants, data.amount, room.requires_approval
+            ) else BookingStatus.APPROVED
 
-        if status == BookingStatus.PENDING_APPROVAL:
-            notify_store.send(
-                booking.user_id,
-                "预订待审批",
-                f"您的预订「{booking.title}」需要审批，请等待审批人处理。",
-                booking_id=booking.id,
-                notif_type="approval",
+            booking = Booking(
+                id=self._gen_id(),
+                room_id=data.room_id,
+                user_id=data.user_id,
+                title=data.title,
+                start_time=start,
+                end_time=end,
+                participants=data.participants,
+                amount=data.amount,
+                status=status,
+                created_at=timeutil.now(),
             )
+            self._bookings[booking.id] = booking
 
-        return {"ok": True, "booking": booking}
+            if status == BookingStatus.PENDING_APPROVAL:
+                notify_store.send(
+                    booking.user_id,
+                    "预订待审批",
+                    f"您的预订「{booking.title}」需要审批，请等待审批人处理。",
+                    booking_id=booking.id,
+                    notif_type="approval",
+                )
+
+            return {"ok": True, "booking": booking}
 
     def get(self, booking_id: str) -> Optional[Booking]:
         return self._bookings.get(booking_id)
@@ -202,82 +211,86 @@ class BookingStore:
         return list(self._bookings.values())
 
     def cancel(self, booking_id: str, user_id: str) -> Dict[str, Any]:
-        b = self._bookings.get(booking_id)
-        if not b:
-            return {"ok": False, "error": "booking not found"}
-        if b.user_id != user_id:
-            return {"ok": False, "error": "not authorized"}
-        if not can_transition(b.status, BookingStatus.CANCELLED):
-            return {"ok": False, "error": f"cannot cancel from status {b.status.value}"}
-        b.status = BookingStatus.CANCELLED
-        return {"ok": True, "booking": b}
+        with self._lock:
+            b = self._bookings.get(booking_id)
+            if not b:
+                return {"ok": False, "error": "booking not found", "status": 404}
+            if b.user_id != user_id:
+                return {"ok": False, "error": "not authorized", "status": 403}
+            if not can_transition(b.status, BookingStatus.CANCELLED):
+                return {"ok": False, "error": f"cannot cancel from status {b.status.value}", "status": 400}
+            b.status = BookingStatus.CANCELLED
+            return {"ok": True, "booking": b}
 
     def release(self, booking_id: str, user_id: str, release_time: Optional[datetime] = None) -> Dict[str, Any]:
-        b = self._bookings.get(booking_id)
-        if not b:
-            return {"ok": False, "error": "booking not found"}
-        if b.user_id != user_id:
-            return {"ok": False, "error": "not authorized"}
-        if b.status != BookingStatus.APPROVED:
-            return {"ok": False, "error": "only approved bookings can be released"}
-        now = timeutil.now()
-        if release_time is None:
-            release_time = now
-        effective_end = b.released_at if b.released_at else b.end_time
-        if release_time > effective_end:
-            return {"ok": False, "error": "release time cannot be after booking end"}
-        b.released_at = release_time
-        if release_time <= now:
-            b.status = BookingStatus.ENDED
-        notify_store.send(
-            b.user_id,
-            "会议室已释放",
-            f"您的预订「{b.title}」已提前释放至 {release_time.strftime('%Y-%m-%d %H:%M')}。",
-            booking_id=b.id,
-            notif_type="info",
-        )
-        return {"ok": True, "booking": b}
+        with self._lock:
+            b = self._bookings.get(booking_id)
+            if not b:
+                return {"ok": False, "error": "booking not found", "status": 404}
+            if b.user_id != user_id:
+                return {"ok": False, "error": "not authorized", "status": 403}
+            if b.status != BookingStatus.APPROVED:
+                return {"ok": False, "error": "only approved bookings can be released", "status": 400}
+            now = timeutil.now()
+            if release_time is None:
+                release_time = now
+            effective_end = b.released_at if b.released_at else b.end_time
+            if release_time > effective_end:
+                return {"ok": False, "error": "release time cannot be after booking end", "status": 400}
+            b.released_at = release_time
+            if release_time <= now:
+                b.status = BookingStatus.ENDED
+            notify_store.send(
+                b.user_id,
+                "会议室已释放",
+                f"您的预订「{b.title}」已提前释放至 {release_time.strftime('%Y-%m-%d %H:%M')}。",
+                booking_id=b.id,
+                notif_type="info",
+            )
+            return {"ok": True, "booking": b}
 
     def renew(self, booking_id: str, user_id: str, new_end_time: datetime) -> Dict[str, Any]:
-        b = self._bookings.get(booking_id)
-        if not b:
-            return {"ok": False, "error": "booking not found"}
-        if b.user_id != user_id:
-            return {"ok": False, "error": "not authorized"}
-        if b.status != BookingStatus.APPROVED:
-            return {"ok": False, "error": "only approved bookings can be renewed"}
-        now = timeutil.now()
-        effective_end = b.released_at if b.released_at else b.end_time
-        if now >= effective_end:
-            return {"ok": False, "error": "booking already ended, cannot renew"}
-        if new_end_time <= effective_end:
-            return {"ok": False, "error": "new end time must be after current end"}
-        conflicts = self.find_conflicts(b.room_id, effective_end, new_end_time, exclude_booking_id=b.id)
-        if conflicts:
-            return {"ok": False, "error": "renewal time conflicts with another booking", "conflicts": conflicts}
-        if b.released_at:
-            b.released_at = None
-        b.end_time = new_end_time
-        notify_store.send(
-            b.user_id,
-            "预订已续订",
-            f"您的预订「{b.title}」已续订至 {new_end_time.strftime('%Y-%m-%d %H:%M')}。",
-            booking_id=b.id,
-            notif_type="info",
-        )
-        return {"ok": True, "booking": b}
+        with self._lock:
+            b = self._bookings.get(booking_id)
+            if not b:
+                return {"ok": False, "error": "booking not found", "status": 404}
+            if b.user_id != user_id:
+                return {"ok": False, "error": "not authorized", "status": 403}
+            if b.status != BookingStatus.APPROVED:
+                return {"ok": False, "error": "only approved bookings can be renewed", "status": 400}
+            now = timeutil.now()
+            effective_end = b.released_at if b.released_at else b.end_time
+            if now >= effective_end:
+                return {"ok": False, "error": "booking already ended, cannot renew", "status": 400}
+            if new_end_time <= effective_end:
+                return {"ok": False, "error": "new end time must be after current end", "status": 400}
+            conflicts = self.find_conflicts(b.room_id, effective_end, new_end_time, exclude_booking_id=b.id)
+            if conflicts:
+                return {"ok": False, "error": "renewal time conflicts with another booking", "conflicts": conflicts, "status": 409}
+            if b.released_at:
+                b.released_at = None
+            b.end_time = new_end_time
+            notify_store.send(
+                b.user_id,
+                "预订已续订",
+                f"您的预订「{b.title}」已续订至 {new_end_time.strftime('%Y-%m-%d %H:%M')}。",
+                booking_id=b.id,
+                notif_type="info",
+            )
+            return {"ok": True, "booking": b}
 
     def _transition(self, booking_id: str, target: BookingStatus, **extra) -> Dict[str, Any]:
-        b = self._bookings.get(booking_id)
-        if not b:
-            return {"ok": False, "error": "booking not found"}
-        if not can_transition(b.status, target):
-            return {"ok": False, "error": f"cannot transition from {b.status.value} to {target.value}"}
-        b.status = target
-        for k, v in extra.items():
-            if hasattr(b, k):
-                setattr(b, k, v)
-        return {"ok": True, "booking": b}
+        with self._lock:
+            b = self._bookings.get(booking_id)
+            if not b:
+                return {"ok": False, "error": "booking not found", "status": 404}
+            if not can_transition(b.status, target):
+                return {"ok": False, "error": f"cannot transition from {b.status.value} to {target.value}", "status": 400}
+            b.status = target
+            for k, v in extra.items():
+                if hasattr(b, k):
+                    setattr(b, k, v)
+            return {"ok": True, "booking": b}
 
     def approve(self, booking_id: str, approver_id: str, remark: Optional[str] = None) -> Dict[str, Any]:
         result = self._transition(booking_id, BookingStatus.APPROVED, approver_id=approver_id, approval_remark=remark)
@@ -306,33 +319,35 @@ class BookingStore:
         return result
 
     def check_reminders(self):
-        now = timeutil.now()
-        for b in self._bookings.values():
-            if b.status != BookingStatus.APPROVED:
-                continue
-            if b.reminder_sent:
-                continue
-            effective_end = b.released_at if b.released_at else b.end_time
-            if now >= effective_end:
-                continue
-            minutes_to_end = timeutil.minutes_until(effective_end, now)
-            if 0 <= minutes_to_end <= config.reminder_minutes_before:
-                b.reminder_sent = True
-                notify_store.send(
-                    b.user_id,
-                    "会议即将结束",
-                    f"您的预订「{b.title}」将在 {minutes_to_end} 分钟后结束，如需续订请及时操作。",
-                    booking_id=b.id,
-                    notif_type="reminder",
-                )
-
-    def auto_update_statuses(self):
-        now = timeutil.now()
-        for b in self._bookings.values():
-            if b.status == BookingStatus.APPROVED:
+        with self._lock:
+            now = timeutil.now()
+            for b in self._bookings.values():
+                if b.status != BookingStatus.APPROVED:
+                    continue
+                if b.reminder_sent:
+                    continue
                 effective_end = b.released_at if b.released_at else b.end_time
                 if now >= effective_end:
-                    b.status = BookingStatus.ENDED
+                    continue
+                minutes_to_end = timeutil.minutes_until(effective_end, now)
+                if 0 <= minutes_to_end <= config.reminder_minutes_before:
+                    b.reminder_sent = True
+                    notify_store.send(
+                        b.user_id,
+                        "会议即将结束",
+                        f"您的预订「{b.title}」将在 {minutes_to_end} 分钟后结束，如需续订请及时操作。",
+                        booking_id=b.id,
+                        notif_type="reminder",
+                    )
+
+    def auto_update_statuses(self):
+        with self._lock:
+            now = timeutil.now()
+            for b in self._bookings.values():
+                if b.status == BookingStatus.APPROVED:
+                    effective_end = b.released_at if b.released_at else b.end_time
+                    if now >= effective_end:
+                        b.status = BookingStatus.ENDED
 
 
 booking_store = BookingStore()
